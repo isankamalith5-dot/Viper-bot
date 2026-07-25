@@ -5785,7 +5785,6 @@ function setupAutoRestart(socket, number) {
                           || (lastDisconnect?.error && lastDisconnect.error.code === 'AUTHENTICATION')
                           || (lastDisconnect?.error && String(lastDisconnect.error).toLowerCase().includes('logged out'))
                           || (lastDisconnect?.reason === DisconnectReason?.loggedOut);
-      console.log(`[${number}] connection closed. statusCode=${statusCode} reason=${lastDisconnect?.error?.message || lastDisconnect?.error}`);
       if (isLoggedOut) {
         console.log(`User ${number} logged out. Cleaning up...`);
         try { await deleteSessionAndCleanup(number, socket); } catch(e){ console.error(e); }
@@ -5869,25 +5868,17 @@ async function EmpirePair(number, res) {
   const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
   const logger = pino({ level: process.env.NODE_ENV === 'production' ? 'fatal' : 'debug' });
 
-  // Always pull the WA web version Baileys currently supports. Using a stale/
-  // hardcoded version is the #1 cause of "pairing code shows but phone never
-  // gets the Link Device confirmation" — the socket connects, the code is
-  // issued, then the server kills the handshake (405 / Connection Failure)
-  // before the phone-side confirmation can happen.
-  // Known-good pinned fallback (community-verified working WA web version as of
-  // mid-2026). Used if the live version fetch fails, times out, or hangs —
-  // fetchLatestBaileysVersion() itself has open bugs where it never resolves
-  // on some hosts.
-  const FALLBACK_WA_VERSION = [2, 3000, 1033893291];
-  let waVersion = FALLBACK_WA_VERSION;
+  // Always negotiate the current WhatsApp Web protocol version.
+  // If the bundled/default version is stale, the socket still opens and a
+  // pairing code is still issued, but WhatsApp silently refuses to push the
+  // "Linked Devices" prompt to the phone (no error is thrown). Fetching the
+  // latest version here is what makes the phone actually receive the request.
+  let waVersion;
   try {
-    const versionResult = await Promise.race([
-      fetchLatestBaileysVersion(),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('fetchLatestBaileysVersion timed out')), 8000))
-    ]);
-    if (versionResult && versionResult.version) waVersion = versionResult.version;
+    const { version } = await fetchLatestBaileysVersion();
+    waVersion = version;
   } catch (e) {
-    console.warn('fetchLatestBaileysVersion failed/timed out, using pinned fallback version:', e?.message || e);
+    console.warn('fetchLatestBaileysVersion failed, falling back to bundled default version:', e?.message || e);
   }
 
   try {
@@ -5895,8 +5886,8 @@ async function EmpirePair(number, res) {
       auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
       printQRInTerminal: false,
       logger,
-      ...(waVersion ? { version: waVersion } : {}),
-      browser: Browsers.ubuntu('Chrome')
+      browser: Browsers.macOS('Safari'),
+      ...(waVersion ? { version: waVersion } : {})
     });
 
     socketCreationTime.set(sanitizedNumber, Date.now());
@@ -5915,11 +5906,7 @@ async function EmpirePair(number, res) {
       let code;
       while (retries > 0) {
         try { await delay(1500); code = await socket.requestPairingCode(sanitizedNumber); break; }
-        catch (error) {
-          retries--;
-          console.error(`[${sanitizedNumber}] requestPairingCode failed (retries left: ${retries}):`, error?.output?.statusCode || error?.message || error);
-          await delay(2000 * (config.MAX_RETRIES - retries));
-        }
+        catch (error) { retries--; await delay(2000 * (config.MAX_RETRIES - retries)); }
       }
       if (!res.headersSent) res.send({ code });
     }
@@ -6082,22 +6069,7 @@ socket.ev.on('creds.update', async () => {
         }
       }
       if (connection === 'close') {
-        const statusCode = update.lastDisconnect?.error?.output?.statusCode;
-        const loggedOut = statusCode === DisconnectReason.loggedOut;
-
-        if (loggedOut) {
-          // Only wipe the session when WhatsApp actually logged the device out.
-          // setupAutoRestart() (registered separately on this same socket)
-          // takes care of reconnecting on any other close reason — it must be
-          // allowed to reuse these exact session files, otherwise credentials
-          // that were just written by creds.update (right after the pairing
-          // code is entered on the phone) get deleted before registration can
-          // finish, which is why the phone never shows the device as linked.
-          try { if (fs.existsSync(sessionPath)) fs.removeSync(sessionPath); } catch(e){}
-          await removeSessionFromMongo(sanitizedNumber).catch(()=>{});
-        } else {
-          console.log(`Connection closed for ${sanitizedNumber} (code: ${statusCode || 'unknown'}), keeping session files for reconnect.`);
-        }
+        try { if (fs.existsSync(sessionPath)) fs.removeSync(sessionPath); } catch(e){}
       }
 
     });
